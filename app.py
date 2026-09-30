@@ -1,30 +1,72 @@
+# -*- coding: utf-8 -*-
+"""
+Aplikasi Streamlit: Prediksi Diabetes
+Perbandingan Naive Bayes vs Decision Tree
+
+Alur data, preprocessing, dan konfigurasi model disamakan dengan
+notebook Naive_vs_Decision_Tree.ipynb.
+"""
 
 import streamlit as st
 import pandas as pd
 import numpy as np
+import matplotlib.pyplot as plt
 
 from pathlib import Path
 from sklearn.compose import ColumnTransformer
 from sklearn.preprocessing import OneHotEncoder, StandardScaler
 from sklearn.pipeline import Pipeline
 from sklearn.naive_bayes import GaussianNB
-from sklearn.model_selection import StratifiedKFold, cross_validate
+from sklearn.tree import DecisionTreeClassifier, plot_tree
+from sklearn.model_selection import (
+    train_test_split,
+    StratifiedKFold,
+    cross_validate
+)
+from sklearn.metrics import (
+    accuracy_score,
+    precision_score,
+    recall_score,
+    f1_score,
+    confusion_matrix,
+    roc_auc_score,
+    roc_curve
+)
 
 # ============================================================
 # KONFIGURASI
 # ============================================================
 
 st.set_page_config(
-    page_title="Prediksi Diabetes - Naive Bayes",
+    page_title="Prediksi Diabetes - Naive Bayes vs Decision Tree",
     page_icon="🩺",
     layout="wide"
 )
 
 DATA_FILE = Path(__file__).parent / "data skripsi.xlsx"
 
+RANDOM_STATE = 42
+
+CATEGORICAL_FEATURES = ["Jenis Kelamin"]
+NUMERIC_FEATURES = [
+    "Usia",
+    "Tinggi Badan",
+    "Berat Badan",
+    "Linkar Perut",
+    "Sistolik",
+    "Diastolik"
+]
+
+CLASS_NAMES = ["Tidak Diabetes", "Diabetes"]
+
+# True  -> model untuk prediksi dilatih memakai seluruh data (200 observasi)
+# False -> model untuk prediksi dilatih memakai data training 80% saja,
+#          persis seperti model di notebook
+TRAIN_ON_ALL_DATA = True
+
 
 # ============================================================
-# FUNGSI
+# FUNGSI DATA & MODEL
 # ============================================================
 
 @st.cache_data
@@ -34,7 +76,10 @@ def load_data():
     # Membersihkan spasi tersembunyi pada nama kolom
     df.columns = df.columns.str.strip()
 
-    # Memisahkan tekanan darah
+    # Acak baris (sama dengan notebook)
+    df = df.sample(frac=1, random_state=RANDOM_STATE)
+
+    # Memisahkan tekanan darah menjadi Sistolik dan Diastolik
     tekanan = df["Tekanan Darah"].astype(str).str.split("/", expand=True)
 
     if tekanan.shape[1] != 2:
@@ -45,7 +90,7 @@ def load_data():
     df["Sistolik"] = pd.to_numeric(tekanan[0], errors="coerce")
     df["Diastolik"] = pd.to_numeric(tekanan[1], errors="coerce")
 
-    df.drop(columns=["Tekanan Darah"], inplace=True)
+    df = df.drop(columns=["Tekanan Darah"])
 
     # Encode target
     df["Label"] = df["Label"].map({
@@ -62,94 +107,145 @@ def load_data():
     return df
 
 
-@st.cache_resource
-def train_model():
-    data = load_data()
+def encode_for_tree(X):
+    """
+    Encoding Decision Tree: One-hot Jenis Kelamin dengan drop_first=True
+    (LK sebagai baseline -> kolom 'Jenis Kelamin_PR'), sama dengan
+    pd.get_dummies(...) pada notebook. Dibuat manual supaya input satu baris
+    dari form selalu menghasilkan kolom yang identik dengan data training.
+    """
+    X_enc = X.drop(columns=["Jenis Kelamin"]).copy()
+    X_enc["Jenis Kelamin_PR"] = (X["Jenis Kelamin"] == "PR").astype(int)
+    return X_enc
 
-    X = data.drop(columns=["Label"])
-    y = data["Label"]
 
-    categorical_features = ["Jenis Kelamin"]
-    numeric_features = [
-        "Usia",
-        "Tinggi Badan",
-        "Berat Badan",
-        "Linkar Perut",
-        "Sistolik",
-        "Diastolik"
-    ]
-
+def build_nb_model():
     preprocessor = ColumnTransformer(
         transformers=[
             (
                 "cat",
                 OneHotEncoder(handle_unknown="ignore"),
-                categorical_features
+                CATEGORICAL_FEATURES
             ),
             (
                 "num",
                 StandardScaler(),
-                numeric_features
+                NUMERIC_FEATURES
             )
         ]
     )
 
-    model = Pipeline(
+    return Pipeline(
         steps=[
             ("preprocessor", preprocessor),
             ("classifier", GaussianNB())
         ]
     )
 
-    # Model final untuk deployment dilatih menggunakan seluruh data
-    model.fit(X, y)
 
-    return model
+def build_tree_model():
+    return DecisionTreeClassifier(
+        criterion="entropy",
+        random_state=RANDOM_STATE
+    )
+
+
+@st.cache_resource
+def train_models():
+    data = load_data()
+
+    X = data.drop(columns=["Label"])
+    y = data["Label"]
+
+    if not TRAIN_ON_ALL_DATA:
+        X, _, y, _ = train_test_split(
+            X,
+            y,
+            test_size=0.20,
+            random_state=RANDOM_STATE,
+            stratify=y
+        )
+
+    nb_model = build_nb_model()
+    nb_model.fit(X, y)
+
+    tree_model = build_tree_model()
+    tree_model.fit(encode_for_tree(X), y)
+
+    return nb_model, tree_model
+
+
+def hitung_metrik(y_true, y_pred, y_prob):
+    tn, fp, fn, tp = confusion_matrix(y_true, y_pred).ravel()
+
+    return {
+        "Accuracy": accuracy_score(y_true, y_pred),
+        "Precision": precision_score(y_true, y_pred, zero_division=0),
+        "Recall / Sensitivity": recall_score(y_true, y_pred, zero_division=0),
+        "Specificity": tn / (tn + fp),
+        "F1-Score": f1_score(y_true, y_pred, zero_division=0),
+        "ROC-AUC": roc_auc_score(y_true, y_prob)
+    }
 
 
 @st.cache_data
-def cross_validation_results():
+def evaluasi_model():
+    """
+    Evaluasi mengikuti notebook:
+    1) Hold-out: train/test split 80:20 (stratified, random_state=42)
+    2) Stratified 10-Fold Cross Validation
+    """
     data = load_data()
 
     X = data.drop(columns=["Label"])
     y = data["Label"]
+    X_tree = encode_for_tree(X)
 
-    categorical_features = ["Jenis Kelamin"]
-    numeric_features = [
-        "Usia",
-        "Tinggi Badan",
-        "Berat Badan",
-        "Linkar Perut",
-        "Sistolik",
-        "Diastolik"
-    ]
-
-    preprocessor = ColumnTransformer(
-        transformers=[
-            (
-                "cat",
-                OneHotEncoder(handle_unknown="ignore"),
-                categorical_features
-            ),
-            (
-                "num",
-                StandardScaler(),
-                numeric_features
-            )
-        ]
+    # ---------------- Hold-out 80:20 ----------------
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y,
+        test_size=0.20,
+        random_state=RANDOM_STATE,
+        stratify=y
     )
 
-    model = Pipeline(
-        steps=[
-            ("preprocessor", preprocessor),
-            ("classifier", GaussianNB())
-        ]
+    X_train_tree, X_test_tree, _, _ = train_test_split(
+        X_tree, y,
+        test_size=0.20,
+        random_state=RANDOM_STATE,
+        stratify=y
     )
 
-    cv = StratifiedKFold(
+    nb = build_nb_model().fit(X_train, y_train)
+    nb_pred = nb.predict(X_test)
+    nb_prob = nb.predict_proba(X_test)[:, 1]
+
+    tree = build_tree_model().fit(X_train_tree, y_train)
+    tree_pred = tree.predict(X_test_tree)
+    tree_prob = tree.predict_proba(X_test_tree)[:, 1]
+
+    holdout = pd.DataFrame([
+        hitung_metrik(y_test, nb_pred, nb_prob),
+        hitung_metrik(y_test, tree_pred, tree_prob)
+    ], index=["Naive Bayes", "Decision Tree"])
+
+    fpr_nb, tpr_nb, _ = roc_curve(y_test, nb_prob)
+    fpr_tree, tpr_tree, _ = roc_curve(y_test, tree_prob)
+
+    visual = {
+        "cm_nb": confusion_matrix(y_test, nb_pred),
+        "cm_tree": confusion_matrix(y_test, tree_pred),
+        "roc_nb": (fpr_nb, tpr_nb, roc_auc_score(y_test, nb_prob)),
+        "roc_tree": (fpr_tree, tpr_tree, roc_auc_score(y_test, tree_prob)),
+        "n_train": len(X_train),
+        "n_test": len(X_test)
+    }
+
+    # ---------------- Stratified 10-Fold CV ----------------
+    skf = StratifiedKFold(
         n_splits=10,
         shuffle=True,
-        random_state=42
+        random_state=RANDOM_STATE
     )
 
     scoring = {
@@ -160,28 +256,25 @@ def cross_validation_results():
         "roc_auc": "roc_auc"
     }
 
-    results = cross_validate(
-        model,
-        X,
-        y,
-        cv=cv,
-        scoring=scoring
+    cv_nb = cross_validate(build_nb_model(), X, y, cv=skf, scoring=scoring)
+    cv_tree = cross_validate(build_tree_model(), X_tree, y, cv=skf, scoring=scoring)
+
+    def ringkas(cv):
+        return {
+            "Accuracy": cv["test_accuracy"].mean(),
+            "Precision": cv["test_precision"].mean(),
+            "Recall": cv["test_recall"].mean(),
+            "F1-Score": cv["test_f1"].mean(),
+            "ROC-AUC": cv["test_roc_auc"].mean(),
+            "Accuracy SD": cv["test_accuracy"].std()
+        }
+
+    cv_summary = pd.DataFrame(
+        [ringkas(cv_nb), ringkas(cv_tree)],
+        index=["Naive Bayes", "Decision Tree"]
     )
 
-    metrics = {
-        "Accuracy": results["test_accuracy"].mean(),
-        "Precision": results["test_precision"].mean(),
-        "Recall / Sensitivity": results["test_recall"].mean(),
-        "F1-Score": results["test_f1"].mean(),
-        "ROC-AUC": results["test_roc_auc"].mean(),
-        "Accuracy SD": results["test_accuracy"].std()
-    }
-
-    return metrics
-
-
-def parse_blood_pressure(systolic, diastolic):
-    return float(systolic), float(diastolic)
+    return holdout, cv_summary, visual
 
 
 # ============================================================
@@ -190,8 +283,8 @@ def parse_blood_pressure(systolic, diastolic):
 
 try:
     data = load_data()
-    model = train_model()
-    metrics = cross_validation_results()
+    nb_model, tree_model = train_models()
+    holdout, cv_summary, visual = evaluasi_model()
 except Exception as e:
     st.error(f"Gagal memuat model/data: {e}")
     st.stop()
@@ -206,25 +299,35 @@ with st.sidebar:
 
     st.write(
         """
-        **Naive Bayes** digunakan sebagai model klasifikasi
-        berdasarkan hasil penelitian.
+        Aplikasi ini membandingkan dua metode klasifikasi:
 
-        Model menggunakan:
+        - **Naive Bayes** (Gaussian NB, fitur numerik distandardisasi)
+        - **Decision Tree** (kriteria *entropy*, tanpa pruning)
+
+        Variabel prediktor:
         - Jenis Kelamin
         - Usia
         - Tinggi Badan
         - Berat Badan
-        - Tekanan Darah
+        - Tekanan Darah (Sistolik & Diastolik)
         - Lingkar Perut
         """
     )
 
     st.divider()
 
-    st.caption(
-        "Model final dilatih menggunakan seluruh data penelitian "
-        "setelah model Naive Bayes dipilih sebagai model terbaik."
-    )
+    if TRAIN_ON_ALL_DATA:
+        st.caption(
+            "Model untuk prediksi dilatih menggunakan seluruh data "
+            "penelitian. Angka performa dihitung dari hold-out 80:20 "
+            "dan Stratified 10-Fold Cross Validation."
+        )
+    else:
+        st.caption(
+            "Model untuk prediksi dilatih menggunakan 80% data training "
+            "(sama dengan notebook). Angka performa dihitung dari "
+            "hold-out 80:20 dan Stratified 10-Fold Cross Validation."
+        )
 
 
 # ============================================================
@@ -232,12 +335,12 @@ with st.sidebar:
 # ============================================================
 
 st.title("🩺 Prediksi Klasifikasi Diabetes")
-st.subheader("Model Naive Bayes")
+st.subheader("Naive Bayes vs Decision Tree")
 
 st.write(
     """
     Masukkan karakteristik individu pada form di bawah untuk memperoleh
-    hasil klasifikasi dari model Naive Bayes.
+    hasil klasifikasi sekaligus probabilitasnya dari kedua model.
     """
 )
 
@@ -248,24 +351,122 @@ st.warning(
 
 
 # ============================================================
-# METRIK MODEL
+# PERFORMA MODEL
 # ============================================================
 
 st.header("Performa Model")
 
-c1, c2, c3, c4, c5 = st.columns(5)
+tab_cv, tab_holdout = st.tabs([
+    "Stratified 10-Fold CV",
+    "Hold-out 80:20"
+])
 
-c1.metric("Accuracy", f"{metrics['Accuracy']:.2%}")
-c2.metric("Precision", f"{metrics['Precision']:.2%}")
-c3.metric("Recall", f"{metrics['Recall / Sensitivity']:.2%}")
-c4.metric("F1-Score", f"{metrics['F1-Score']:.2%}")
-c5.metric("ROC-AUC", f"{metrics['ROC-AUC']:.2%}")
+with tab_cv:
+    tampil_cv = cv_summary.drop(columns=["Accuracy SD"]).T
+    tampil_cv.index.name = "Metrik"
 
-st.caption(
-    f"Evaluasi menggunakan Stratified 10-Fold Cross Validation. "
-    f"Rata-rata accuracy = {metrics['Accuracy']:.2%} "
-    f"± {metrics['Accuracy SD']:.2%}."
-)
+    st.dataframe(
+        tampil_cv.style.format("{:.2%}").highlight_max(
+            axis=1, color="#d4edda"
+        ),
+        use_container_width=True
+    )
+
+    st.caption(
+        "Rata-rata 10 fold. Accuracy Naive Bayes = "
+        f"{cv_summary.loc['Naive Bayes', 'Accuracy']:.2%} "
+        f"± {cv_summary.loc['Naive Bayes', 'Accuracy SD']:.2%}; "
+        "Decision Tree = "
+        f"{cv_summary.loc['Decision Tree', 'Accuracy']:.2%} "
+        f"± {cv_summary.loc['Decision Tree', 'Accuracy SD']:.2%}. "
+        "Sel hijau menandai nilai tertinggi pada tiap metrik."
+    )
+
+with tab_holdout:
+    tampil_ho = holdout.T
+    tampil_ho.index.name = "Metrik"
+
+    st.dataframe(
+        tampil_ho.style.format("{:.2%}").highlight_max(
+            axis=1, color="#d4edda"
+        ),
+        use_container_width=True
+    )
+
+    st.caption(
+        f"Data training = {visual['n_train']}, data testing = "
+        f"{visual['n_test']} (split stratified, random_state = "
+        f"{RANDOM_STATE}). Sel hijau menandai nilai tertinggi."
+    )
+
+with st.expander("Confusion Matrix, ROC Curve, dan Struktur Decision Tree"):
+    v1, v2 = st.columns(2)
+
+    with v1:
+        fig, axes = plt.subplots(1, 2, figsize=(9, 4))
+
+        for ax, cm, judul, cmap in [
+            (axes[0], visual["cm_nb"], "Naive Bayes", "Blues"),
+            (axes[1], visual["cm_tree"], "Decision Tree", "Greens")
+        ]:
+            ax.imshow(cm, cmap=cmap)
+            ax.set_title(f"Confusion Matrix - {judul}", fontsize=10)
+            ax.set_xticks([0, 1])
+            ax.set_yticks([0, 1])
+            ax.set_xticklabels(CLASS_NAMES, fontsize=8)
+            ax.set_yticklabels(CLASS_NAMES, fontsize=8)
+            ax.set_xlabel("Predicted")
+            ax.set_ylabel("Actual")
+
+            for i in range(2):
+                for j in range(2):
+                    ax.text(
+                        j, i, cm[i, j],
+                        ha="center", va="center",
+                        color="white" if cm[i, j] > cm.max() / 2 else "black",
+                        fontsize=12
+                    )
+
+        fig.tight_layout()
+        st.pyplot(fig)
+        plt.close(fig)
+
+    with v2:
+        fig, ax = plt.subplots(figsize=(5, 4))
+
+        fpr, tpr, auc_val = visual["roc_nb"]
+        ax.plot(fpr, tpr, label=f"Naive Bayes (AUC = {auc_val:.3f})")
+
+        fpr, tpr, auc_val = visual["roc_tree"]
+        ax.plot(fpr, tpr, label=f"Decision Tree (AUC = {auc_val:.3f})")
+
+        ax.plot([0, 1], [0, 1], linestyle="--", color="gray")
+        ax.set_xlabel("False Positive Rate")
+        ax.set_ylabel("True Positive Rate")
+        ax.set_title("ROC Curve (Hold-out)")
+        ax.legend(fontsize=8)
+        ax.grid(alpha=0.3)
+
+        fig.tight_layout()
+        st.pyplot(fig)
+        plt.close(fig)
+
+    st.write("**Struktur Decision Tree (model untuk prediksi)**")
+
+    fig, ax = plt.subplots(figsize=(20, 10))
+    plot_tree(
+        tree_model,
+        feature_names=encode_for_tree(
+            data.drop(columns=["Label"])
+        ).columns.tolist(),
+        class_names=CLASS_NAMES,
+        filled=True,
+        rounded=True,
+        ax=ax
+    )
+    ax.set_title("Decision Tree Visualization")
+    st.pyplot(fig)
+    plt.close(fig)
 
 
 # ============================================================
@@ -342,6 +543,39 @@ with col2:
 # PREDIKSI
 # ============================================================
 
+def tampilkan_hasil(judul, model, X_input):
+    """Menampilkan kelas prediksi dan probabilitas untuk satu model."""
+    prediction = int(model.predict(X_input)[0])
+    probabilities = model.predict_proba(X_input)[0]
+
+    prob_tidak = probabilities[0]
+    prob_diabetes = probabilities[1]
+
+    st.subheader(judul)
+
+    if prediction == 1:
+        st.error(
+            f"### Hasil: Diabetes\n"
+            f"Probabilitas Diabetes: **{prob_diabetes:.2%}**"
+        )
+    else:
+        st.success(
+            f"### Hasil: Tidak Diabetes\n"
+            f"Probabilitas Tidak Diabetes: **{prob_tidak:.2%}**"
+        )
+
+    m1, m2 = st.columns(2)
+    m1.metric("Probabilitas Tidak Diabetes", f"{prob_tidak:.2%}")
+    m2.metric("Probabilitas Diabetes", f"{prob_diabetes:.2%}")
+
+    st.progress(
+        float(prob_diabetes),
+        text=f"Probabilitas Diabetes: {prob_diabetes:.2%}"
+    )
+
+    return prediction
+
+
 if st.button(
     "🔍 Lakukan Prediksi",
     type="primary",
@@ -358,44 +592,42 @@ if st.button(
         "Diastolik": [diastolik]
     })
 
-    prediction = model.predict(input_data)[0]
-    probabilities = model.predict_proba(input_data)[0]
-
-    prob_tidak = probabilities[0]
-    prob_diabetes = probabilities[1]
-
     st.divider()
     st.header("Hasil Prediksi")
 
-    if prediction == 1:
-        st.error("### Hasil: Diabetes")
-        st.write(
-            "Model mengklasifikasikan data input ke dalam kelas **Diabetes**."
+    hasil_col1, hasil_col2 = st.columns(2)
+
+    with hasil_col1:
+        pred_nb = tampilkan_hasil(
+            "Naive Bayes",
+            nb_model,
+            input_data
+        )
+
+    with hasil_col2:
+        pred_tree = tampilkan_hasil(
+            "Decision Tree",
+            tree_model,
+            encode_for_tree(input_data)
+        )
+
+    if pred_nb == pred_tree:
+        st.info(
+            "Kedua model memberikan klasifikasi yang **sama**: "
+            f"**{CLASS_NAMES[pred_nb]}**."
         )
     else:
-        st.success("### Hasil: Tidak Diabetes")
-        st.write(
-            "Model mengklasifikasikan data input ke dalam kelas "
-            "**Tidak Diabetes**."
+        st.warning(
+            "Kedua model memberikan klasifikasi yang **berbeda**: "
+            f"Naive Bayes → **{CLASS_NAMES[pred_nb]}**, "
+            f"Decision Tree → **{CLASS_NAMES[pred_tree]}**."
         )
 
-    r1, r2 = st.columns(2)
-
-    with r1:
-        st.metric(
-            "Probabilitas Tidak Diabetes",
-            f"{prob_tidak:.2%}"
-        )
-
-    with r2:
-        st.metric(
-            "Probabilitas Diabetes",
-            f"{prob_diabetes:.2%}"
-        )
-
-    st.progress(
-        float(prob_diabetes),
-        text=f"Probabilitas Diabetes: {prob_diabetes:.2%}"
+    st.caption(
+        "Catatan: Decision Tree tanpa pruning memberi probabilitas berupa "
+        "proporsi kelas pada daun (leaf) tempat data jatuh, sehingga sering "
+        "bernilai 0% atau 100%. Probabilitas Naive Bayes bersifat lebih "
+        "'halus' karena dihitung dari distribusi Gaussian tiap fitur."
     )
 
     with st.expander("Lihat data input"):
